@@ -1,0 +1,193 @@
+# =============================================================================
+#  macOS 26 + sshx — persistent, on-demand remote shell
+# -----------------------------------------------------------------------------
+#  What it does
+#    • Boots a GitHub-hosted macOS 26 (Apple Silicon) instance.
+#    • Installs sshx and starts an end-to-end-encrypted, browser-accessible
+#      terminal, printing the shareable https://sshx.io/s/...#...  link.
+#    • Keeps the instance alive and auto-restarts a fresh instance on a timer so
+#      the session is effectively "always up" until you decide to kill it.
+#
+#  Triggers
+#    • workflow_dispatch (mode=start)  -> boot a live session now   (the "trigger")
+#    • workflow_dispatch (mode=stop)   -> cancel the running VM + disable auto-restart
+#    • schedule (every 4h)             -> self-heal: spin up a fresh instance so it
+#                                         never stays down (this is the "keep alive")
+#
+#  Kill it
+#    Easiest : Actions tab -> this workflow -> (···) -> "Disable workflow".
+#    Or      : run the workflow with mode=stop (cancels the live run + disables).
+#    Re-enable later with:  gh workflow enable macos-sshx.yml   then mode=start.
+#
+#  IMPORTANT limits (GitHub-hosted runners, cannot be raised)
+#    • 6 hours max per job, 72 hours max per workflow run.
+#      => "permanent" is achieved by chaining short runs via the schedule trigger.
+#      => A NEW instance + NEW sshx link is created every ~4h cycle.
+#    • macOS minutes bill at a 10x multiplier on private repos (free on public).
+#      24/7 usage is very expensive on private repos — prefer a public repo or a
+#      self-hosted runner for true 24/7 with a stable link.
+# =============================================================================
+
+name: macOS 26 SSHX
+
+run-name: "macOS 26 SSHX — ${{ github.event.inputs.mode == 'stop' && 'STOP' || 'live session' }}"
+
+on:
+  # Manual trigger — the primary "start" / "stop" button.
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "start = boot macOS 26 + sshx (default). stop = kill the running VM and disable auto-restart."
+        type: choice
+        options:
+          - start
+          - stop
+        default: start
+
+  # Self-heal: spin up a fresh instance on a fixed cadence so it stays "up".
+  # Runs on the default branch. GitHub may delay scheduled runs under load;
+  # the 4h cadence + the 356-min in-job self-timer keep coverage continuous.
+  schedule:
+    - cron: "0 */4 * * *"
+
+# Only one instance at a time. Starting anything new (cron, manual start, or a
+# stop command) cancels any instance that is currently running.
+concurrency:
+  group: macos-sshx-vm
+  cancel-in-progress: true
+
+# actions: write  -> gh can cancel runs and disable/enable the workflow.
+# contents: read  -> checkout / repo metadata.
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The live macOS 26 + sshx session.
+  # ---------------------------------------------------------------------------
+  session:
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.mode != 'stop') ||
+      github.event_name == 'schedule'
+    runs-on: macos-26
+    timeout-minutes: 359   # backstop just under the 360-min (6h) hard cap
+    steps:
+      - name: System info
+        shell: bash
+        run: |
+          echo "Event: ${{ github.event_name }}"
+          sw_vers || true
+          uname -a
+          echo "Architecture: $(uname -m)"
+
+      - name: Launch sshx + keep instance alive until kill or self-timer
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          LOG="$RUNNER_TEMP/sshx.log"
+          : > "$LOG"
+
+          # Launch sshx in headless/CI mode (installs + runs), backgrounded.
+          # The official one-liner handles PATH and TTY detection for us.
+          start_sshx() {
+            ( curl -sSf https://sshx.io/get | sh -s run ) >> "$LOG" 2>&1 &
+            echo "$!"
+          }
+
+          echo "=== Launching sshx ==="
+          SSHX_PID="$(start_sshx)"
+          echo "sshx launcher PID: $SSHX_PID"
+
+          # Pull the most recent sshx link (including the secret #key fragment).
+          extract_link() { grep 'Link:' "$1" | tail -n1 | sed -E 's/.*(https:\/\/sshx\.io\/s\/[^ ]+).*/\1/'; }
+
+          # Wait up to 90s for the link to appear.
+          LINK=""
+          for _ in $(seq 1 90); do
+            LINK="$(extract_link "$LOG")"
+            [ -n "$LINK" ] && break
+            if ! kill -0 "$SSHX_PID" 2>/dev/null; then
+              echo "sshx exited before producing a link. Log so far:"; cat "$LOG"; exit 1
+            fi
+            sleep 1
+          done
+
+          if [ -z "$LINK" ]; then
+            echo "Timed out waiting for sshx link. Log:"; cat "$LOG"; exit 1
+          fi
+
+          echo ""
+          echo "########################################################"
+          echo "#  sshx session URL:"
+          echo "#      $LINK"
+          echo "########################################################"
+          echo ""
+
+          # Surface the link as a run annotation + on the run's summary page.
+          echo "::notice::sshx macOS 26 session ready: $LINK"
+          {
+            echo "## macOS 26 — sshx live session"
+            echo ""
+            echo "**Link:** \`${LINK}\`"
+            echo ""
+            echo "Open it in any browser for an interactive, end-to-end-encrypted terminal."
+            echo ""
+            echo "- VM: \`macos-26\` (Apple Silicon). Auto-restarts ~every 4h — a **new link** is issued each cycle."
+            echo "- **Kill:** run the workflow with \`mode=stop\`, or Actions → this workflow → ⋯ → **Disable workflow**."
+            echo "- GitHub-hosted cap is 6h/job; this workflow chains runs to stay up."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # ---- Keep the instance alive until the self-timer backstop ----
+          # 356 min leaves headroom below the 360-min job cap; the every-4h cron
+          # normally replaces this run first, this timer only fires if a cron is
+          # delayed/missed.
+          DEADLINE=$(( $(date +%s) + 356 * 60 ))
+          echo "Keepalive active until $(date -r "$DEADLINE") ..."
+
+          while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+            if ! kill -0 "$SSHX_PID" 2>/dev/null; then
+              echo "$(date '+%F %T') sshx stopped — relaunching..."
+              SSHX_PID="$(start_sshx)"
+              sleep 15
+              NEW="$(extract_link "$LOG")"
+              if [ -n "$NEW" ] && [ "$NEW" != "$LINK" ]; then
+                LINK="$NEW"
+                echo "::notice::sshx reconnected (new link): $LINK"
+                echo "New link: $LINK"
+              fi
+            fi
+            sleep 30
+          done
+
+          echo "Reached keepalive deadline ($(date '+%F %T')); exiting cleanly. Next cron restarts the instance."
+          exit 0
+
+  # ---------------------------------------------------------------------------
+  # Kill switch: cancel any running instance and disable auto-restart.
+  # ---------------------------------------------------------------------------
+  stop:
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'stop'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Cancel running instance + disable the workflow
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          # The concurrency group already cancels the live run when this job starts;
+          # this loop also mops up any other queued/in-progress runs of this workflow.
+          for status in in_progress queued; do
+            for id in $(gh run list --workflow macos-sshx.yml --repo "$GITHUB_REPOSITORY" \
+                          --status "$status" --json databaseId -q '.[].databaseId' 2>/dev/null || true); do
+              [ "$id" = "$GITHUB_RUN_ID" ] && continue
+              echo "Cancelling run $id ..."
+              gh run cancel "$id" --repo "$GITHUB_REPOSITORY" || true
+            done
+          done
+          echo "Disabling the workflow (stops the every-4h auto-restart) ..."
+          gh workflow disable macos-sshx.yml --repo "$GITHUB_REPOSITORY" || true
+          echo "Done. To start again: gh workflow enable macos-sshx.yml && gh workflow run macos-sshx.yml -f mode=start"
