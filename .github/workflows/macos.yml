@@ -26,6 +26,12 @@
 #    • macOS minutes bill at a 10x multiplier on private repos (free on public).
 #      24/7 usage is very expensive on private repos — prefer a public repo or a
 #      self-hosted runner for true 24/7 with a stable link.
+#
+#  Shell gotcha (the cause of the first failed run)
+#    GitHub runs every step as:  bash --noprofile --norc -e -o pipefail {0}
+#    i.e. errexit (-e) AND pipefail are ON. Any command that can legitimately
+#    return non-zero (e.g. grep with no match) MUST be explicitly guarded, or it
+#    kills the step. The keep-alive script below guards every such command.
 # =============================================================================
 
 name: macOS 26 SSHX
@@ -84,13 +90,27 @@ jobs:
       - name: Launch sshx + keep instance alive until kill or self-timer
         shell: bash
         run: |
-          set -uo pipefail
+          # NOTE: this step runs under `bash -e -o pipefail` (GitHub default),
+          # so every command that may legitimately fail is explicitly guarded.
 
           LOG="$RUNNER_TEMP/sshx.log"
           : > "$LOG"
 
-          # Launch sshx in headless/CI mode (installs + runs), backgrounded.
-          # The official one-liner handles PATH and TTY detection for us.
+          # Portable "epoch -> human time" (BSD date uses -r N; GNU date uses -d @N).
+          fmt_epoch() { date -r "$1" 2>/dev/null || date -d "@$1" 2>/dev/null; }
+
+          # Always returns 0: strips ANSI colour codes, then extracts the most
+          # recent sshx URL (including the secret #key fragment), or prints nothing.
+          extract_link() {
+            { sed $'s/\x1b\\[[0-9;]*m//g' "$1" \
+                | grep -oE 'https://sshx\.io/s/[^[:space:]#]+#[^[:space:]]+' \
+                | tail -n1; } || true
+          }
+
+          # Install + run sshx in headless CI mode, backgrounded, logging to $LOG.
+          # The redirection on the WHOLE subshell is important: it stops the
+          # background process from holding open the command-substitution pipe,
+          # so `SSHX_PID="$(start_sshx)"` returns immediately.
           start_sshx() {
             ( curl -sSf https://sshx.io/get | sh -s run ) >> "$LOG" 2>&1 &
             echo "$!"
@@ -100,12 +120,9 @@ jobs:
           SSHX_PID="$(start_sshx)"
           echo "sshx launcher PID: $SSHX_PID"
 
-          # Pull the most recent sshx link (including the secret #key fragment).
-          extract_link() { grep 'Link:' "$1" | tail -n1 | sed -E 's/.*(https:\/\/sshx\.io\/s\/[^ ]+).*/\1/'; }
-
-          # Wait up to 90s for the link to appear.
+          # Wait up to 120s for the link to appear.
           LINK=""
-          for _ in $(seq 1 90); do
+          for _ in $(seq 1 120); do
             LINK="$(extract_link "$LOG")"
             [ -n "$LINK" ] && break
             if ! kill -0 "$SSHX_PID" 2>/dev/null; then
@@ -144,7 +161,7 @@ jobs:
           # normally replaces this run first, this timer only fires if a cron is
           # delayed/missed.
           DEADLINE=$(( $(date +%s) + 356 * 60 ))
-          echo "Keepalive active until $(date -r "$DEADLINE") ..."
+          echo "Keepalive active until $(fmt_epoch "$DEADLINE") ..."
 
           while [ "$(date +%s)" -lt "$DEADLINE" ]; do
             if ! kill -0 "$SSHX_PID" 2>/dev/null; then
